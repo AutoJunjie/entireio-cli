@@ -201,9 +201,180 @@ Shadow 分支和 metadata 分支的 commit 对象中包含 `AuthorName` 和 `Aut
 
 ---
 
+## 解决方案
+
+### 方案 1：在 pre-push hook 中拦截 shadow 分支推送（防误操作）
+
+**解决问题：** Shadow 分支含未脱敏原始数据，`git push --all` 会误推。
+
+**实现思路：** 在现有的 `PrePush` hook（`hooks_git_cmd.go:190`）中增加检查逻辑。Git 的 pre-push hook 会通过 stdin 接收即将推送的 refspec 列表，可以检测是否包含 shadow 分支并阻断。
+
+**修改点：**
+- `strategy/manual_commit_push.go` — `PrePush()` 方法增加 stdin 解析
+- 读取 stdin 中的 refspec，如果包含 `entire/<hash>` 格式（但不是 `entire/checkpoints/v1`），返回错误阻断推送
+- 输出警告信息告知用户 shadow 分支不应被推送
+
+**示例逻辑：**
+```go
+// 在 PrePush 中增加
+scanner := bufio.NewScanner(os.Stdin)
+for scanner.Scan() {
+    fields := strings.Fields(scanner.Text())
+    localRef := fields[0]
+    if strings.HasPrefix(localRef, "refs/heads/entire/") &&
+       localRef != "refs/heads/"+paths.MetadataBranchName {
+        return fmt.Errorf("blocked push of shadow branch %s (contains unredacted data)", localRef)
+    }
+}
+```
+
+**复杂度：** 低。改动约 20 行代码。
+
+---
+
+### 方案 2：在 `redact/redact.go` 中增加 PII 检测层
+
+**解决问题：** 当前脱敏系统完全不检测 PII。
+
+**实现思路：** 在现有的双层检测基础上，增加第三层——基于正则的 PII 模式匹配。
+
+**修改点：**
+- `redact/redact.go` — `String()` 函数中增加第 3 步 PII 检测
+
+**需要覆盖的 PII 模式：**
+```go
+var piiPatterns = []*regexp.Regexp{
+    // 邮箱
+    regexp.MustCompile(`[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`),
+    // 中国手机号
+    regexp.MustCompile(`\b1[3-9]\d{9}\b`),
+    // 中国身份证号
+    regexp.MustCompile(`\b\d{17}[\dXx]\b`),
+    // 信用卡号（Luhn 校验前的粗筛）
+    regexp.MustCompile(`\b(?:\d[ -]*?){13,19}\b`),
+    // IPv4
+    regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`),
+    // 美国 SSN
+    regexp.MustCompile(`\b\d{3}-\d{2}-\d{4}\b`),
+}
+```
+
+**注意事项：**
+- 正则检测 PII 误报率高（如 "192.168.1.1" 是 IP 也可能是版本号）
+- 需要在 `shouldSkipJSONLField` 中排除更多结构字段，避免误伤
+- 姓名无法用正则检测（尤其中文姓名），只能覆盖结构化 PII
+- 建议通过 settings 配置开关，默认关闭以免影响现有用户
+
+**复杂度：** 中。改动约 80-120 行代码 + 测试。
+
+---
+
+### 方案 3：用户自定义脱敏规则（settings 配置）
+
+**解决问题：** 不同用户/团队有不同的敏感数据定义，内置规则无法覆盖所有场景。
+
+**实现思路：** 在 `.entire/settings.json` 中支持 `redact_patterns` 配置项，允许用户自定义正则脱敏规则。
+
+**修改点：**
+- `settings/settings.go` — `EntireSettings` 增加 `RedactPatterns` 字段
+- `redact/redact.go` — `String()` 函数在 gitleaks 检测后，追加用户自定义正则匹配
+
+**配置示例：**
+```json
+{
+  "enabled": true,
+  "redact_patterns": [
+    {
+      "name": "china-phone",
+      "pattern": "1[3-9]\\d{9}",
+      "description": "中国手机号"
+    },
+    {
+      "name": "china-id-card",
+      "pattern": "\\d{17}[\\dXx]",
+      "description": "中国身份证号"
+    },
+    {
+      "name": "company-internal-id",
+      "pattern": "EMP-\\d{6}",
+      "description": "内部员工编号"
+    }
+  ]
+}
+```
+
+**注意事项：**
+- 需要在 settings 加载时预编译正则，避免每次脱敏都重复编译
+- `settings.json` 会被 commit 到仓库，团队共享规则；`settings.local.json` 存放个人规则
+- 正则错误需要友好提示，不能静默失败
+
+**复杂度：** 中。改动约 100-150 行代码 + 测试。
+
+---
+
+### 方案 4：Shadow 分支也做脱敏（纵深防御）
+
+**解决问题：** 即使 shadow 分支被误推，数据也已经过脱敏。
+
+**实现思路：** 在 `checkpoint/temporary.go` 的 `WriteTemporary` 中，对 transcript、prompt、context 也执行脱敏。
+
+**修改点：**
+- `checkpoint/temporary.go` — `WriteTemporary()` 和 `WriteTemporaryTask()` 中增加 redact 调用
+
+**当前状态：** 从代码看，`temporary.go` 中已经对 subagent transcript 和 incremental data 做了脱敏（`redact.JSONLBytes`），但**主 transcript 写入 shadow 分支时并未脱敏**。这是因为 shadow 分支直接从磁盘读取 agent 的原始 transcript 文件。
+
+**注意事项：**
+- 脱敏后 rewind 功能恢复的内容也是脱敏过的，密钥信息不可恢复
+- 双重脱敏（shadow + metadata）会略微增加 CPU 开销，但 gitleaks 检测很快
+- 这是纵深防御的最后一道防线
+
+**复杂度：** 低。改动约 10-20 行代码。
+
+---
+
+### 方案 5：Git commit 元数据匿名化
+
+**解决问题：** Shadow 和 metadata 分支的 commit 对象暴露真实 `user.name` 和 `user.email`。
+
+**实现思路：** 在创建 shadow/metadata 分支的 commit 时，使用匿名化的 author 信息。
+
+**修改点：**
+- `checkpoint/committed.go` — `GetGitAuthorFromRepo()` 返回值用于 commit，可改为返回固定匿名值
+- 或在 `WriteCommitted` / `WriteTemporary` 中覆盖 `AuthorName`/`AuthorEmail`
+
+**示例：**
+```go
+// 用匿名信息替代真实 git author
+const anonymousAuthorName = "Entire CLI"
+const anonymousAuthorEmail = "noreply@entire.io"
+```
+
+**注意事项：**
+- 仅影响 entire 自己创建的内部 commit（shadow/metadata 分支），不影响用户工作分支上的 commit
+- 如果团队需要追踪谁的 session 产生了哪些 checkpoint，匿名化会丢失这个信息
+- 可以做成 settings 开关：`"anonymous_commits": true`
+
+**复杂度：** 低。改动约 10 行代码。
+
+---
+
+### 推荐实施优先级
+
+| 优先级 | 方案 | 理由 |
+|-------|------|------|
+| P0 | 方案 1：拦截 shadow 分支推送 | 改动最小，防护效果最大，阻止最严重的泄露路径 |
+| P0 | 方案 4：Shadow 分支也做脱敏 | 改动小，纵深防御，即使方案 1 被绕过也有保护 |
+| P1 | 方案 5：Commit 元数据匿名化 | 改动小，堵住 git author 泄露 PII 的路径 |
+| P1 | 方案 2：内置 PII 检测 | 覆盖最常见的 PII 格式，需要权衡误报率 |
+| P2 | 方案 3：用户自定义脱敏规则 | 灵活性最高，但需要用户主动配置 |
+
+**建议组合：** 先实施 P0（方案 1 + 4），再做 P1（方案 2 + 5），最后按需做 P2。P0 两个方案合计改动不超过 40 行代码，可以快速落地。
+
+---
+
 ## 总结与建议
 
-### 建议
+### 用户侧建议（当前可立即执行）
 
 1. **不要在 Agent 对话中发送任何敏感信息**（密钥、个人信息均包括在内）。改用环境变量、`.env` 文件等间接方式。
 2. **确保仓库是 private 的。** 这是最简单有效的保护，公开仓库的 transcript 对全网可见。
