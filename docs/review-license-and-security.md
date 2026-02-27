@@ -136,9 +136,78 @@ Shadow 分支被删除后，数据仍存在于 `git reflog` 中，直到 `git gc
 | Shadow 分支误推 | **完全没有防护** |
 | 对话上下文泄露 | **无法防护** |
 
+---
+
+## PII（个人身份信息）保护分析
+
+### 结论：没有任何 PII 保护
+
+项目的脱敏系统（`redact/redact.go`）**只针对 secrets（密钥/令牌），不检测 PII**。
+
+脱敏的两层检测机制均无法识别个人信息：
+
+- **熵值检测**（Shannon entropy > 4.5）：PII 是自然语言或结构化数据，熵值远低于阈值
+- **gitleaks 模式匹配**：180+ 规则全部针对 API key/token 格式，不包含 PII 模式
+
+### PII 泄露矩阵
+
+| PII 类型 | 会被脱敏吗 | 原因 |
+|---------|-----------|------|
+| 姓名（如 "张三"、"John Smith"） | **不会** | 熵值极低，不匹配任何模式 |
+| 邮箱（如 `zhangsan@gmail.com`） | **不会** | 熵值不足 4.5，gitleaks 不检测邮箱 |
+| 手机号（如 `13800138000`） | **不会** | 纯数字不匹配正则 `[A-Za-z0-9+_=-]{10,}` |
+| 身份证号（如 `110101199001011234`） | **不会** | 同上，纯数字被排除 |
+| 物理地址 | **不会** | 自然语言，熵值极低 |
+| 信用卡号 | **不会** | gitleaks 不检测信用卡格式 |
+| IP 地址 | **不会** | 含有 `.` 分隔符，不匹配正则 |
+
+### PII 暴露路径
+
+#### 1. Session Transcript（对话记录）
+
+存储在 `entire/checkpoints/v1` 分支的 `full.jsonl` 中，包含用户和 Agent 之间的**完整对话原文**。如果对话中提及了个人信息，会被原样保留。
+
+#### 2. User Prompts（用户输入）
+
+存储在 `prompt.txt` 中。如果用户在 prompt 中包含姓名、邮箱等信息，不会被过滤。
+
+#### 3. Git Commit 元数据
+
+Shadow 分支和 metadata 分支的 commit 对象中包含 `AuthorName` 和 `AuthorEmail`（来自用户的 git 配置）。这些信息直接写入 git 对象，**完全不经过脱敏**。
+
+相关代码路径：
+- `checkpoint/checkpoint.go`：`WriteTemporaryOptions.AuthorName/AuthorEmail`
+- `checkpoint/checkpoint.go`：`WriteCommittedOptions.AuthorName/AuthorEmail`
+- `strategy/common.go`：`GetGitAuthorFromRepo()` 读取 `user.name` 和 `user.email`
+
+#### 4. 遥测数据
+
+`machineid.ProtectedID("entire-cli")` 生成设备指纹发送到 PostHog。虽然不直接包含姓名邮箱，但配合 IP 地址（即使 `DisableGeoIP: true`，PostHog 服务端仍可记录来源 IP）可能关联到个人身份。
+
+#### 5. 本地日志
+
+`docs/architecture/logging.md` 明确规定不记录 PII，但这个约束**只作用于本地日志**（`.entire/logs/`），不影响 transcript 的存储。Transcript 才是主要的 PII 暴露面。
+
+### 与 GDPR/个人信息保护法的冲突
+
+如果用户在 EU 或中国使用此工具，以下行为可能构成合规风险：
+
+| 行为 | 风险 |
+|------|------|
+| 对话记录推送到 GitHub | 可能违反数据最小化原则 |
+| 设备指纹发送到 PostHog | 需要明确告知和同意（当前告知不够显著） |
+| Git author 信息写入 metadata 分支 | 邮箱地址是 PII，推送到远端即暴露 |
+| 无法删除已推送的 transcript | 可能违反"被遗忘权"（需要 force push + gc） |
+
+---
+
+## 总结与建议
+
 ### 建议
 
-1. **不要在 Agent 对话中直接发送密钥。** 改用环境变量、`.env` 文件等方式让 agent 间接引用密钥。
-2. **确保仓库是 private 的。** 这是最简单有效的保护。
+1. **不要在 Agent 对话中发送任何敏感信息**（密钥、个人信息均包括在内）。改用环境变量、`.env` 文件等间接方式。
+2. **确保仓库是 private 的。** 这是最简单有效的保护，公开仓库的 transcript 对全网可见。
 3. **永远不要 `git push --all`。** 这会把含有未脱敏数据的 shadow 分支推到远端。
 4. **推送前检查分支。** 运行 `git branch -a | grep entire/` 确认只推送 `entire/checkpoints/v1`。
+5. **考虑禁用 session push。** 在 `.entire/settings.json` 中设置 `push_sessions: false`，手动控制何时推送 transcript。
+6. **如果涉及 PII 合规**，建议完全不推送 `entire/checkpoints/v1` 分支，或自建 PII 检测层。
